@@ -39,7 +39,7 @@ WIDTH=60
 CHOICE_HEIGHT=20
 
 image[xray]="teddysun/xray:1.8.4"
-image[sing-box]="gzxhwq/sing-box:v1.6.0-beta.1"
+image[sing-box]="gzxhwq/sing-box:v1.6.5"
 image[nginx]="nginx:1.24.0"
 image[certbot]="certbot/certbot:v2.6.0"
 image[haproxy]="haproxy:2.8.0"
@@ -98,13 +98,15 @@ regex[ip]="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
 regex[tgbot_token]="^[0-9]{8,10}:[a-zA-Z0-9_-]{35}$"
 regex[tgbot_admins]="^[a-zA-Z][a-zA-Z0-9_]{4,31}(,[a-zA-Z][a-zA-Z0-9_]{4,31})*$"
 regex[domain_port]="^[a-zA-Z0-9]+([-.][a-zA-Z0-9]+)*\.[a-zA-Z]{2,}(:[1-9][0-9]*)?$"
+regex[file_path]="^[a-zA-Z0-9_/.-]+$"
+regex[url]="^(http|https)://([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}|[0-9]{1,3}(\.[0-9]{1,3}){3})(:[0-9]{1,5})?(/.*)?$"
 
 function show_help {
   echo ""
   echo "Usage: reality-ezpz.sh [-t|--transport=tcp|http|grpc|ws|tuic|hysteria2] [-d|--domain=<domain>] [--server=<server>] [--regenerate] [--default]
   [-r|--restart] [--enable-safenet=true|false] [--port=<port>] [-c|--core=xray|sing-box]
   [--enable-warp=true|false] [--warp-license=<license>] [--security=reality|letsencrypt|selfsigned] [-m|--menu] [--show-server-config] 
-  [--add-user=<username>] [--lists-users] [--show-user=<username>] [--delete-user=<username>] [-u|--uninstall]"
+  [--add-user=<username>] [--lists-users] [--show-user=<username>] [--delete-user=<username>] [--backup] [--restore=<url|file>] [-u|--uninstall]"
   echo ""
   echo "  -t, --transport <tcp|http|grpc|ws|tuic|hysteria2> Transport protocol (tcp, http, grpc, ws, tuic, hysteria2, default: ${defaults[transport]})"
   echo "  -d, --domain <domain>     Domain to use as SNI (default: ${defaults[domain]})"
@@ -128,13 +130,15 @@ function show_help {
   echo "      --list-users          List all users"
   echo "      --show-user <username> Shows the config and QR code of the user"
   echo "      --delete-user <username> Delete the user"
+  echo "      --backup              Backup users and configuration and upload it to keep.sh"
+  echo "      --restore <url|file>  Restore backup from URL or file"
   echo "  -h, --help                Display this help message"
   return 1
 }
 
 function parse_args {
   local opts
-  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,server:,regenerate,default,restart,uninstall,enable-safenet:,port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,enable-tgbot:,tgbot-token:,tgbot-admins:,help -- "$@")
+  opts=$(getopt -o t:d:ruc:mh --long transport:,domain:,server:,regenerate,default,restart,uninstall,enable-safenet:,port:,warp-license:,enable-warp:,core:,security:,menu,show-server-config,add-user:,list-users,show-user:,delete-user:,backup,restore:,enable-tgbot:,tgbot-token:,tgbot-admins:,help -- "$@")
   if [[ $? -ne 0 ]]; then
     return 1
   fi
@@ -312,6 +316,18 @@ function parse_args {
         args[delete_user]="$2"
         shift 2
         ;;
+      --backup)
+        args[backup]=true
+        shift
+        ;;
+      --restore)
+        args[restore]="$2"
+        if [[ ! ${args[restore]} =~ ${regex[file_path]} ]] && [[ ! ${args[restore]} =~ ${regex[url]} ]]; then
+          echo "Invalid: Backup file path or URL is not valid."
+          return 1
+        fi
+        shift 2
+        ;;
       -h|--help)
         return 1
         ;;
@@ -333,7 +349,49 @@ function parse_args {
   if [[ -n ${args[warp_license]} ]]; then
     args[warp]=ON
   fi
+}
 
+function backup {
+  local backup_name
+  local backup_file_url
+  local exit_code
+  backup_name=reality-ezpz-backup-$(date +%Y-%m-%d_%H-%M-%S).tar.gz
+  tar -czf "/tmp/${backup_name}" -C "${config_path}" ./
+  if ! backup_file_url=$(curl -fsS --upload-file "/tmp/${backup_name}" https://free.keep.sh); then
+    rm -f "/tmp/${backup_name}"
+    echo "Error in uploading backup file" >&2
+    return 1
+  fi
+  rm -f "/tmp/${backup_name}"
+  echo "${backup_file_url}"
+  return
+}
+
+function restore {
+  local backup_file=$1
+  local temp_file
+  if [[ ! -r ${backup_file} ]]; then
+    temp_file=$(mktemp -u)
+    if ! curl -fSsL "${backup_file}" -o "${temp_file}"; then
+      echo "Cannot download or find backup file" >&2
+      return 1
+    fi
+    backup_file="${temp_file}"
+  fi
+  if ! tar -tzf "${backup_file}" | grep -q config; then
+    echo "The provided file is not a reality-ezpz backup file." >&2
+    rm -f "${temp_file}"
+    return 1
+  fi
+  rm -rf "${config_path}"
+  mkdir -p "${config_path}"
+  if ! tar -xzf "${backup_file}" -C "${config_path}"; then
+    echo "Error in backup restore." >&2
+    rm -f "${temp_file}"
+    return 1
+  fi
+  rm -f "${temp_file}"
+  return
 }
 
 function dict_expander {
@@ -622,10 +680,10 @@ version: "3"
 networks:
   reality:
     driver: bridge
+    enable_ipv6: true
     ipam:
       config:
-      - subnet: 10.255.255.0/24
-        gateway: 10.255.255.1
+      - subnet: fc11::1:0/112
 services:
   engine:
     image: ${image[${config[core]}]}
@@ -691,6 +749,13 @@ EOF
 function generate_tgbot_compose {
   cat >"${path[tgbot_compose]}" <<EOF
 version: "3"
+networks:
+  tgbot:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+      - subnet: fc11::2:0/112
 services:
   tgbot:
     build: ./
@@ -700,7 +765,10 @@ services:
       BOT_ADMIN: ${config[tgbot_admins]}
     volumes:
     - /var/run/docker.sock:/var/run/docker.sock
-    - ../:/opt/reality-ezpz
+    - ../:${config_path}
+    - /etc/docker/:/etc/docker/
+    networks:
+    - tgbot
 EOF
 }
 
@@ -723,7 +791,7 @@ defaults
   timeout tarpit 5s
 frontend http
   mode http
-  bind :8080
+  bind :::8080 v4v6
 $(if [[ ${config[security]} == 'letsencrypt' ]]; then echo "
   use_backend certbot if { path_beg /.well-known/acme-challenge }
   acl letsencrypt-acl path_beg /.well-known/acme-challenge
@@ -732,7 +800,7 @@ $(if [[ ${config[security]} == 'letsencrypt' ]]; then echo "
   use_backend default
 frontend tls
 $(if [[ ${config[transport]} != 'tcp' ]]; then echo "
-  bind :8443 ssl crt /usr/local/etc/haproxy/server.pem alpn h2,http/1.1
+  bind :::8443 v4v6 ssl crt /usr/local/etc/haproxy/server.pem alpn h2,http/1.1
   mode http
   http-request set-header Host ${config[server]}
 $(if [[ ${config[security]} == 'letsencrypt' ]]; then echo "
@@ -743,7 +811,7 @@ $(if [[ ${config[transport]} != 'tuic' && ${config[transport]} != 'hysteria2' ]]
 "; fi)
   use_backend default
 "; else echo "
-  bind :8443
+  bind :::8443 v4v6
   mode tcp
   use_backend engine
 "; fi)
@@ -843,8 +911,8 @@ EOF
 function generate_tgbot_dockerfile {
   cat >"${path[tgbot_dockerfile]}" << EOF
 FROM ${image[python]}
-WORKDIR /opt/reality-ezpz/tgbot
-RUN apk add --no-cache docker-cli-compose curl bash newt libqrencode sudo openssl jq
+WORKDIR ${config_path}/tgbot
+RUN apk add --no-cache docker-cli-compose curl bash newt libqrencode-tools sudo openssl jq
 RUN pip install --no-cache-dir python-telegram-bot==13.5
 CMD [ "python", "./tgbot.py" ]
 EOF
@@ -869,6 +937,7 @@ function generate_engine_config {
   local tls_object=""
   local warp_object=""
   local reality_port=443
+  local temp_file
   if [[ ${config[transport]} == 'tuic' ]]; then
     type='tuic'
   elif [[ ${config[transport]} == 'hysteria2' ]]; then
@@ -938,7 +1007,7 @@ function generate_engine_config {
     "servers": [
     $([[ ${config[safenet]} == ON ]] && echo '{"address": "tcp://1.1.1.3", "detour": "dns"},{"address": "tcp://1.0.0.3", "detour": "dns"}' || echo '{"address": "tcp://1.1.1.1", "detour": "dns"},{"address": "tcp://1.0.0.1", "detour": "dns"}')
     ],
-    "strategy": "ipv4_only"
+    "strategy": "prefer_ipv4"
   },
   "inbounds": [
     {
@@ -955,7 +1024,7 @@ function generate_engine_config {
       "listen_port": 8443,
       "sniff": true,
       "sniff_override_destination": true,
-      "domain_strategy": "ipv4_only",
+      "domain_strategy": "prefer_ipv4",
       "users": [${users_object}],
       $(if [[ ${config[security]} == 'reality' ]]; then
         echo "${reality_object}"
@@ -1213,6 +1282,15 @@ EOF
 }
 EOF
   fi
+  if [[ -r ${config_path}/${config[core]}.patch ]]; then
+    if ! jq empty ${config_path}/${config[core]}.patch; then
+      echo "${config[core]}.patch is not a valid json file. Fix it or remove it!"
+      exit 1
+    fi
+    temp_file=$(mktemp)
+    jq -s add ${path[engine]} ${config_path}/${config[core]}.patch > ${temp_file}
+    mv ${temp_file} ${path[engine]}
+  fi
 }
 
 function generate_config {
@@ -1239,9 +1317,15 @@ function generate_config {
   fi
 }
 
+function get_ipv6 {
+  curl -fsSL --ipv6 https://cloudflare.com/cdn-cgi/trace 2> /dev/null | grep ip | cut -d '=' -f2
+}
+
 function print_client_configuration {
   local username=$1
   local client_config
+  local ipv6
+  local client_config_ipv6
   if [[ ${config[transport]} == 'tuic' ]]; then
     client_config="tuic://"
     client_config="${client_config}${users[${username}]}"
@@ -1289,6 +1373,19 @@ function print_client_configuration {
   echo "Or you can scan the QR code:"
   echo ""
   qrencode -t ansiutf8 "${client_config}"
+  ipv6=$(get_ipv6)
+  if [[ -n $ipv6 ]]; then
+    client_config_ipv6=$(echo "$client_config" | sed "s/@${config[server]}:/@[${ipv6}]:/" | sed "s/#${username}/#${username}-ipv6/")
+    echo ""
+    echo "==================IPv6 Config======================"
+    echo "Client configuration:"
+    echo ""
+    echo "$client_config_ipv6"
+    echo ""
+    echo "Or you can scan the QR code:"
+    echo ""
+    qrencode -t ansiutf8 "${client_config_ipv6}"
+  fi
 }
 
 function upgrade {
@@ -1297,7 +1394,7 @@ function upgrade {
   local warp_id
   if [[ -e "${HOME}/reality/config" ]]; then
     ${docker_cmd} --project-directory "${HOME}/reality" down --remove-orphans --timeout 2
-    mv -f "${HOME}/reality" /opt/reality-ezpz
+    mv -f "${HOME}/reality" ${config_path}
   fi
   uuid=$(grep '^uuid=' "${path[config]}" 2>/dev/null | cut -d= -f2 || true)
   if [[ -n $uuid ]]; then
@@ -1403,7 +1500,7 @@ function add_user_menu {
       break
     fi
     view_user_menu "${username}"
-  done   
+  done
 }
 
 function delete_user_menu {
@@ -1615,6 +1712,8 @@ function configuration_menu {
       "10" "Restart Services" \
       "11" "Regenerate Keys" \
       "12" "Restore Defaults" \
+      "13" "Create Backup" \
+      "14" "Restore Backup" \
       3>&1 1>&2 2>&3)
     if [[ $? -ne 0 ]]; then
       break
@@ -1655,6 +1754,12 @@ function configuration_menu {
         ;;
       12 )
         restore_defaults_menu
+        ;;
+      13 )
+        backup_menu
+        ;;
+      14 )
+        restore_backup_menu
         ;;
     esac
   done
@@ -1991,6 +2096,64 @@ function config_tgbot_menu {
   config[tgbot_admins]=$old_tgbot_admins
 }
 
+function backup_menu {
+  local result
+  whiptail \
+    --clear \
+    --backtitle "$BACKTITLE" \
+    --title "Backup" \
+    --yesno "Do you want to create a backup from users and configuration?" \
+    $HEIGHT $WIDTH \
+    3>&1 1>&2 2>&3
+  if [[ $? -ne 0 ]]; then
+    return
+  fi
+  if result=$(backup 2>&1); then
+    echo "Backup has been create and uploaded successfully."
+    echo "You can download the backup file from here:"
+    echo "${result}"
+    echo ""
+    echo "The URL is valid for 24h."
+    echo
+    echo "Press Enter to return ..."
+    read
+  else
+    message_box "Backup Failed" "${result}"
+  fi
+}
+
+function restore_backup_menu {
+  local backup_file
+  local result
+  while true; do
+    backup_file=$(whiptail \
+      --clear \
+      --backtitle "$BACKTITLE" \
+      --title "Restore Backup" \
+      --inputbox "Enter backup file path or URL" \
+      $HEIGHT $WIDTH \
+      3>&1 1>&2 2>&3)
+    if [[ $? -ne 0 ]]; then
+      break
+    fi
+    if [[ ! $backup_file =~ ${regex[file_path]} ]] && [[ ! $backup_file =~ ${regex[url]} ]]; then
+      message_box "Invalid Backup path of URL" "Backup file path or URL is not valid."
+      continue
+    fi
+    if result=$(restore ${backup_file} 2>&1); then
+      parse_config_file
+      parse_users_file
+      build_config
+      update_config_file
+      update_users_file
+      message_box "Backup Restore Successful" "Backup has been restored successfully."
+      break
+    else
+      message_box "Backup Restore Failed" "${result}"
+    fi
+  done
+}
+
 function restart_docker_compose {
   ${docker_cmd} --project-directory ${config_path} -p ${compose_project} down --remove-orphans --timeout 2 || true
   ${docker_cmd} --project-directory ${config_path} -p ${compose_project} up --build -d --remove-orphans --build
@@ -2223,14 +2386,55 @@ EOF
   sysctl -qp /etc/sysctl.d/99-reality-ezpz.conf >/dev/null 2>&1 || true
 }
 
+function configure_docker {
+  local docker_config="/etc/docker/daemon.json"
+  local config_modified=false
+  local temp_file
+  temp_file=$(mktemp)
+  if [[ ! -f "${docker_config}" ]] || [[ ! -s "${docker_config}" ]]; then
+    echo '{"experimental": true, "ip6tables": true}' | jq . > "${docker_config}"
+    config_modified=true
+  else
+    if ! jq . "${docker_config}" &> /dev/null; then
+      echo '{"experimental": true, "ip6tables": true}' | jq . > "${docker_config}"
+      config_modified=true
+    else
+      if jq 'if .experimental != true or .ip6tables != true then .experimental = true | .ip6tables = true else . end' "${docker_config}" | jq . > "${temp_file}"; then
+        if ! cmp --silent "${docker_config}" "${temp_file}"; then
+          mv "${temp_file}" "${docker_config}"
+          config_modified=true
+        fi
+      fi
+    fi
+  fi
+  rm -f "${temp_file}"
+  if [[ "${config_modified}" = true ]] || ! systemctl is-active --quiet docker; then
+    sudo systemctl restart docker || true
+  fi
+}
+
 parse_args "$@" || show_help
 if [[ $EUID -ne 0 ]]; then
     echo "This script must be run as root."
     exit 1
 fi
+if [[ ${args[backup]} == true ]]; then
+  if backup_url=$(backup); then
+    echo "Backup created successfully. You can download the backup file from this address:"
+    echo "${backup_url}"
+    echo "The URL is valid for 24h."
+  fi
+fi
+if [[ -n ${args[restore]} ]]; then
+  if restore ${args[restore]}; then
+    args[restart]=true
+    echo "Backup has been restored successfully."
+  fi
+fi
 generate_file_list
 install_packages
 install_docker
+configure_docker
 upgrade
 parse_config_file
 parse_users_file
